@@ -15,16 +15,55 @@ use bytes::Bytes;
 use eth2::types as api_types;
 use lighthouse_network::PubsubMessage;
 use network::NetworkMessage;
+use serde::Deserialize;
 use ssz::{Decode, Encode};
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
-use types::{BlockImportSource, EthSpec, SignedExecutionPayloadEnvelope};
+use types::{BlobsList, BlockImportSource, EthSpec, SignedExecutionPayloadEnvelope};
 use warp::{
     Filter, Rejection, Reply,
     hyper::{Body, Response},
 };
+
+/// Stateless publish body used by external builders: the signed envelope nested under
+/// `signed_execution_payload_envelope`, carrying its `blobs` (and `kzg_proofs`) in the body
+/// so the beacon node can derive and broadcast data column sidecars for a payload it did not
+/// build locally. Mirrors the beacon-API `SignedExecutionPayloadEnvelopeContents`. `kzg_proofs`
+/// are intentionally not modelled here — the node recomputes cells and proofs from `blobs` — so
+/// serde ignores that key if present.
+#[derive(Deserialize)]
+#[serde(bound = "E: EthSpec")]
+struct SignedExecutionPayloadEnvelopeContents<E: EthSpec> {
+    signed_execution_payload_envelope: SignedExecutionPayloadEnvelope<E>,
+    #[serde(default)]
+    blobs: BlobsList<E>,
+}
+
+/// The accepted body shapes for `POST /eth/v1/beacon/execution_payload_envelopes`: either the
+/// bare signed envelope (local self-build — blobs are taken from the pending-envelope cache) or
+/// the stateless contents wrapper carrying blobs in the body (external builder).
+#[derive(Deserialize)]
+#[serde(bound = "E: EthSpec", untagged)]
+enum PublishEnvelopeRequest<E: EthSpec> {
+    Contents(SignedExecutionPayloadEnvelopeContents<E>),
+    Bare(SignedExecutionPayloadEnvelope<E>),
+}
+
+impl<E: EthSpec> PublishEnvelopeRequest<E> {
+    /// Split into the envelope and any blobs supplied in the request body. `None` blobs means
+    /// the caller did not provide them and the node should fall back to its local cache.
+    fn into_parts(self) -> (SignedExecutionPayloadEnvelope<E>, Option<BlobsList<E>>) {
+        match self {
+            PublishEnvelopeRequest::Contents(contents) => (
+                contents.signed_execution_payload_envelope,
+                Some(contents.blobs),
+            ),
+            PublishEnvelopeRequest::Bare(envelope) => (envelope, None),
+        }
+    }
+}
 
 // POST beacon/execution_payload_envelopes (SSZ)
 pub(crate) fn post_beacon_execution_payload_envelopes_ssz<T: BeaconChainTypes>(
@@ -52,7 +91,7 @@ pub(crate) fn post_beacon_execution_payload_envelopes_ssz<T: BeaconChainTypes>(
                             .map_err(|e| {
                             warp_utils::reject::custom_bad_request(format!("invalid SSZ: {e:?}"))
                         })?;
-                    publish_execution_payload_envelope(envelope, chain, &network_tx).await
+                    publish_execution_payload_envelope(envelope, None, chain, &network_tx).await
                 })
             },
         )
@@ -75,12 +114,14 @@ pub(crate) fn post_beacon_execution_payload_envelopes<T: BeaconChainTypes>(
         .and(chain_filter.clone())
         .and(network_tx_filter.clone())
         .then(
-            |envelope: SignedExecutionPayloadEnvelope<T::EthSpec>,
+            |request: PublishEnvelopeRequest<T::EthSpec>,
              task_spawner: TaskSpawner<T::EthSpec>,
              chain: Arc<BeaconChain<T>>,
              network_tx: UnboundedSender<NetworkMessage<T::EthSpec>>| {
                 task_spawner.spawn_async_with_rejection(Priority::P0, async move {
-                    publish_execution_payload_envelope(envelope, chain, &network_tx).await
+                    let (envelope, body_blobs) = request.into_parts();
+                    publish_execution_payload_envelope(envelope, body_blobs, chain, &network_tx)
+                        .await
                 })
             },
         )
@@ -91,6 +132,7 @@ pub(crate) fn post_beacon_execution_payload_envelopes<T: BeaconChainTypes>(
 /// <https://github.com/ethereum/beacon-APIs/pull/580>.
 pub async fn publish_execution_payload_envelope<T: BeaconChainTypes>(
     envelope: SignedExecutionPayloadEnvelope<T::EthSpec>,
+    body_blobs: Option<BlobsList<T::EthSpec>>,
     chain: Arc<BeaconChain<T>>,
     network_tx: &UnboundedSender<NetworkMessage<T::EthSpec>>,
 ) -> Result<Response<Body>, Rejection> {
@@ -110,7 +152,10 @@ pub async fn publish_execution_payload_envelope<T: BeaconChainTypes>(
         "Publishing signed execution payload envelope to network"
     );
 
-    let blobs_and_proofs = chain.pending_payload_envelopes.write().take_blobs(slot);
+    // Prefer blobs supplied in the request body (stateless publish from an external builder);
+    // otherwise fall back to the blobs cached locally during block production (self-build).
+    let blobs_and_proofs =
+        body_blobs.or_else(|| chain.pending_payload_envelopes.write().take_blobs(slot));
 
     // Spawn the column-build task (CPU-bound KZG cell-and-proof computation) before
     // publishing the envelope so it runs in parallel with envelope gossip, narrowing
